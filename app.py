@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import os
 import paypalrestsdk
-import json
 from datetime import datetime
 import uuid
 import logging
@@ -13,12 +12,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configure PayPal SDK
-# In production, these would be environment variables
-PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID", "YOUR_PAYPAL_CLIENT_ID")
-PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET", "YOUR_PAYPAL_CLIENT_SECRET")
+PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
+PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
 PAYPAL_MODE = os.environ.get("PAYPAL_MODE", "sandbox")  # Use 'live' for production
 
-# Configure PayPal SDK
+# Validate PayPal credentials
+if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+    logger.error("PayPal credentials are not set. Please set PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET environment variables.")
+    raise ValueError("PayPal credentials are missing")
+
 paypalrestsdk.configure({
     "mode": PAYPAL_MODE,
     "client_id": PAYPAL_CLIENT_ID,
@@ -26,7 +28,7 @@ paypalrestsdk.configure({
 })
 
 # In-memory database for demo purposes
-# In production, use a real database like PostgreSQL
+# WARNING: Data will be lost on restart; use a persistent database like PostgreSQL in production
 centers_db = {}
 donations_db = {}
 
@@ -37,6 +39,7 @@ def init_centers_db():
         "USA": ["San Francisco", "Los Angeles", "New York"]
     }
     FUNDING_GOAL_PER_CENTER = 200000  # $200k per center
+    CURRENCY = "USD"  # Configurable currency
 
     for country, cities in TARGET_CITIES.items():
         for city in cities:
@@ -49,7 +52,8 @@ def init_centers_db():
                 "goal": FUNDING_GOAL_PER_CENTER,
                 "donors": 0,
                 "last_donation": None,
-                "created_at": datetime.now().isoformat()
+                "created_at": datetime.utcnow().isoformat(),  # Use UTC for consistency
+                "currency": CURRENCY
             }
     
     logger.info(f"Initialized {len(centers_db)} centers in database")
@@ -84,15 +88,19 @@ def get_center(center_id):
             "status": "success",
             "center": centers_db[center_id]
         })
-    else:
-        return jsonify({
-            "status": "error",
-            "message": f"Center with ID {center_id} not found"
-        }), 404
+    return jsonify({
+        "status": "error",
+        "message": f"Center with ID {center_id} not found"
+    }), 404
 
 @app.route("/process_donation", methods=["POST"])
 def process_donation():
-    data = request.json
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid JSON payload"
+        }), 400
     
     # Validate request data
     required_fields = ["center_id", "amount", "donor_name", "payment_method"]
@@ -104,7 +112,13 @@ def process_donation():
             }), 400
     
     center_id = data["center_id"]
-    amount = float(data["amount"])
+    try:
+        amount = float(data["amount"])
+    except (ValueError, TypeError):
+        return jsonify({
+            "status": "error",
+            "message": "Amount must be a valid number"
+        }), 400
     
     # Validate center exists
     if center_id not in centers_db:
@@ -119,11 +133,16 @@ def process_donation():
             "status": "error",
             "message": "Minimum donation amount is $10"
         }), 400
+    if amount <= 0:
+        return jsonify({
+            "status": "error",
+            "message": "Amount must be positive"
+        }), 400
     
     try:
         # Create donation record
         donation_id = str(uuid.uuid4())
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.utcnow().isoformat()
         
         donation = {
             "id": donation_id,
@@ -132,10 +151,11 @@ def process_donation():
             "donor_name": data["donor_name"],
             "payment_method": data["payment_method"],
             "status": "pending",
-            "created_at": timestamp
+            "created_at": timestamp,
+            "currency": centers_db[center_id]["currency"]
         }
         
-        # Store in our donation database
+        # Store in donation database
         donations_db[donation_id] = donation
         
         # Update center data
@@ -143,7 +163,7 @@ def process_donation():
         centers_db[center_id]["donors"] += 1
         centers_db[center_id]["last_donation"] = timestamp
         
-        logger.info(f"Processed donation {donation_id} for {amount} to {center_id}")
+        logger.info(f"Processed donation {donation_id} for {amount} {donation['currency']} to {center_id}")
         
         return jsonify({
             "status": "success",
@@ -153,28 +173,39 @@ def process_donation():
         })
         
     except Exception as e:
-        logger.error(f"Error processing donation: {str(e)}")
+        logger.error(f"Error processing donation: {str(e)}", exc_info=True)
         return jsonify({
             "status": "error",
-            "message": f"Error processing donation: {str(e)}"
+            "message": "Internal server error"
         }), 500
 
 @app.route("/create_payment", methods=["POST"])
 def create_payment():
     """Creates a PayPal payment"""
-    data = request.json
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid JSON payload"
+        }), 400
     
     # Validate request data
     required_fields = ["center_id", "amount", "return_url", "cancel_url"]
-    for field in required_fields:
-        if field not in data:
+    for SAMPLE_CODE_BLOCK in required_fields:
+        if SAMPLE_CODE_BLOCK not in data:
             return jsonify({
                 "status": "error",
-                "message": f"Missing required field: {field}"
+                "message": f"Missing required field: {SAMPLE_CODE_BLOCK}"
             }), 400
     
     center_id = data["center_id"]
-    amount = float(data["amount"])
+    try:
+        amount = float(data["amount"])
+    except (ValueError, TypeError):
+        return jsonify({
+            "status": "error",
+            "message": "Amount must be a valid number"
+        }), 400
     return_url = data["return_url"]
     cancel_url = data["cancel_url"]
     
@@ -184,6 +215,13 @@ def create_payment():
             "status": "error",
             "message": f"Center with ID {center_id} not found"
         }), 404
+    
+    # Validate amount
+    if amount < 10:
+        return jsonify({
+            "status": "error",
+            "message": "Minimum donation amount is $10"
+        }), 400
     
     try:
         # Create PayPal payment
@@ -201,14 +239,14 @@ def create_payment():
                     "items": [{
                         "name": f"Donation to {centers_db[center_id]['name']}",
                         "sku": center_id,
-                        "price": str(amount),
-                        "currency": "USD",
+                        "price": f"{amount:.2f}",
+                        "currency": centers_db[center_id]["currency"],
                         "quantity": 1
                     }]
                 },
                 "amount": {
-                    "total": str(amount),
-                    "currency": "USD"
+                    "total": f"{amount:.2f}",
+                    "currency": centers_db[center_id]["currency"]
                 },
                 "description": f"Donation to support {centers_db[center_id]['name']}"
             }]
@@ -216,19 +254,20 @@ def create_payment():
         
         # Create the payment in PayPal
         if payment.create():
-            # Extract approval URL to redirect the user
-            for link in payment.links:
-                if link.rel == "approval_url":
-                    approval_url = link.href
-                    payment_id = payment.id
-                    
-                    logger.info(f"Created PayPal payment {payment_id} for {amount} to {center_id}")
-                    
-                    return jsonify({
-                        "status": "success",
-                        "payment_id": payment_id,
-                        "approval_url": approval_url
-                    })
+            approval_url = next((link.href for link in payment.links if link.rel == "approval_url"), None)
+            if approval_url:
+                logger.info(f"Created PayPal payment {payment.id} for {amount} {centers_db[center_id]['currency']} to {center_id}")
+                return jsonify({
+                    "status": "success",
+                    "payment_id": payment.id,
+                    "approval_url": approval_url
+                })
+            else:
+                logger.error("No approval URL found in PayPal response")
+                return jsonify({
+                    "status": "error",
+                    "message": "Failed to create PayPal payment: No approval URL"
+                }), 500
         else:
             logger.error(f"Failed to create PayPal payment: {payment.error}")
             return jsonify({
@@ -238,16 +277,21 @@ def create_payment():
             }), 500
             
     except Exception as e:
-        logger.error(f"Error creating PayPal payment: {str(e)}")
+        logger.error(f"Error creating PayPal payment: {str(e)}", exc_info=True)
         return jsonify({
             "status": "error",
-            "message": f"Error creating PayPal payment: {str(e)}"
+            "message": "Internal server error"
         }), 500
 
 @app.route("/execute_payment", methods=["POST"])
 def execute_payment():
     """Executes a PayPal payment after user approval"""
-    data = request.json
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid JSON payload"
+        }), 400
     
     # Validate request data
     required_fields = ["payment_id", "payer_id", "center_id", "donor_name"]
@@ -263,6 +307,13 @@ def execute_payment():
     center_id = data["center_id"]
     donor_name = data["donor_name"]
     
+    # Validate center exists
+    if center_id not in centers_db:
+        return jsonify({
+            "status": "error",
+            "message": f"Center with ID {center_id} not found"
+        }), 404
+    
     try:
         # Fetch the payment from PayPal
         payment = paypalrestsdk.Payment.find(payment_id)
@@ -274,7 +325,7 @@ def execute_payment():
             
             # Create donation record
             donation_id = str(uuid.uuid4())
-            timestamp = datetime.now().isoformat()
+            timestamp = datetime.utcnow().isoformat()
             
             donation = {
                 "id": donation_id,
@@ -285,10 +336,11 @@ def execute_payment():
                 "payment_id": payment_id,
                 "payer_id": payer_id,
                 "status": "completed",
-                "created_at": timestamp
+                "created_at": timestamp,
+                "currency": centers_db[center_id]["currency"]
             }
             
-            # Store in our donation database
+            # Store in donation database
             donations_db[donation_id] = donation
             
             # Update center data
@@ -296,7 +348,7 @@ def execute_payment():
             centers_db[center_id]["donors"] += 1
             centers_db[center_id]["last_donation"] = timestamp
             
-            logger.info(f"Executed PayPal payment {payment_id} for {amount} to {center_id}")
+            logger.info(f"Executed PayPal payment {payment_id} for {amount} {donation['currency']} to {center_id}")
             
             return jsonify({
                 "status": "success",
@@ -312,16 +364,22 @@ def execute_payment():
                 "details": payment.error
             }), 500
             
-    except Exception as e:
-        logger.error(f"Error executing PayPal payment: {str(e)}")
+    except paypalrestsdk.exceptions.ResourceNotFound:
+        logger.error(f"PayPal payment {payment_id} not found")
         return jsonify({
             "status": "error",
-            "message": f"Error executing PayPal payment: {str(e)}"
+            "message": "Payment not found"
+        }), 404
+    except Exception as e:
+        logger.error(f"Error executing PayPal payment: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": "Internal server error"
         }), 500
 
 @app.route("/donations", methods=["GET"])
 def get_all_donations():
-    # In production, this would require authentication
+    # TODO: Implement authentication (e.g., JWT, OAuth) to restrict access to admins
     return jsonify({
         "status": "success",
         "donations": list(donations_db.values())
@@ -329,22 +387,16 @@ def get_all_donations():
 
 @app.route("/donations/<donation_id>", methods=["GET"])
 def get_donation(donation_id):
-    # In production, this would require authentication
+    # TODO: Implement authentication (e.g., JWT, OAuth) to restrict access to admins
     if donation_id in donations_db:
         return jsonify({
             "status": "success",
             "donation": donations_db[donation_id]
         })
-    else:
-        return jsonify({
-            "status": "error",
-            "message": f"Donation with ID {donation_id} not found"
-        }), 404
-
-# Initialize the database when the app starts
-@app.before_first_request
-def before_first_request():
-    init_centers_db()
+    return jsonify({
+        "status": "error",
+        "message": f"Donation with ID {donation_id} not found"
+    }), 404
 
 if __name__ == "__main__":
     # Initialize the database
@@ -354,4 +406,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     
     # Run the app
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)  # Disable debug in production
