@@ -1,0 +1,4 @@
+flask
+gunicorn
+paypalrestsdk
+python-dotenv
